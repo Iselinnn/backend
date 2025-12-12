@@ -1,0 +1,56 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model User {
+  steamId   String   @id @unique
+  avatar    String?
+  name      String?
+  tradeUrl  String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  inventory UserInventory?
+}
+
+model UserInventory {
+  id        Int      @id @default(autoincrement())
+  user      User     @relation(fields: [userSteamId], references: [steamId])
+  userSteamId String @unique
+  items     String   // SQLite doesn't have JSON type, store as string
+  updatedAt DateTime @updatedAt
+}
+
+model ItemPriceHistory {
+  id           Int      @id @default(autoincrement())
+  itemName     String
+  price        Float
+  sourceMarket String
+  timestamp    DateTime @default(now())
+
+  @@index([itemName])
+  @@index([timestamp])
+}
+
+model Item {
+  id              Int      @id @default(autoincrement())
+  marketHashName  String   @unique // Unique identifier from Steam (e.g., "AK-47 | Redline (Field-Tested)")
+  name            String   // Display name
+  imageUrl        String   // Full URL to image: https://community.cloudflare.steamstatic.com/economy/image/{icon_url}
+  iconUrl         String   // Steam icon_url (relative path)
+  type            String?  // Item type (weapon, knife, glove, etc.)
+  rarity          String?  // Rarity (Consumer, Industrial, etc.)
+  marketable      Int      @default(0) // 0 or 1
+  tradable        Int      @default(0) // 0 or 1
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([marketHashName])
+}

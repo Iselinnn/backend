@@ -1,0 +1,52 @@
+# Multi-stage build для оптимизации размера
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+# Копируем только файлы зависимостей
+COPY package*.json ./
+COPY prisma ./prisma/
+
+# Устанавливаем все зависимости (включая dev для сборки)
+RUN npm ci
+
+# Копируем исходный код
+COPY . .
+
+# Генерируем Prisma клиент
+RUN npx prisma generate
+
+# Собираем приложение
+RUN npm run build:prod
+
+# Production stage
+FROM node:20-alpine AS production
+
+WORKDIR /app
+
+# Устанавливаем только production зависимости
+COPY package*.json ./
+RUN npm ci --production && npm cache clean --force
+
+# Копируем только необходимые файлы
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/prisma ./prisma
+COPY --from=builder /app/node_modules/.prisma ./node_modules/.prisma
+
+# Генерируем Prisma клиент в production
+RUN npx prisma generate
+
+# Удаляем ненужные файлы
+RUN rm -rf /app/node_modules/@prisma/client/node_modules/@prisma/engines \
+    && rm -rf /app/node_modules/.cache \
+    && find /app/node_modules -name "*.md" -delete \
+    && find /app/node_modules -name "*.map" -delete \
+    && find /app/node_modules -name "test" -type d -exec rm -rf {} + 2>/dev/null || true \
+    && find /app/node_modules -name "tests" -type d -exec rm -rf {} + 2>/dev/null || true \
+    && find /app/node_modules -name "*.test.js" -delete \
+    && find /app/node_modules -name "*.spec.js" -delete
+
+EXPOSE 3000
+
+CMD ["node", "dist/main"]
+
