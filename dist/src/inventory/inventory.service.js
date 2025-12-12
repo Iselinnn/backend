@@ -1,0 +1,392 @@
+"use strict";
+var __decorate = (this && this.__decorate) || function (decorators, target, key, desc) {
+    var c = arguments.length, r = c < 3 ? target : desc === null ? desc = Object.getOwnPropertyDescriptor(target, key) : desc, d;
+    if (typeof Reflect === "object" && typeof Reflect.decorate === "function") r = Reflect.decorate(decorators, target, key, desc);
+    else for (var i = decorators.length - 1; i >= 0; i--) if (d = decorators[i]) r = (c < 3 ? d(r) : c > 3 ? d(target, key, r) : d(target, key)) || r;
+    return c > 3 && r && Object.defineProperty(target, key, r), r;
+};
+var __metadata = (this && this.__metadata) || function (k, v) {
+    if (typeof Reflect === "object" && typeof Reflect.metadata === "function") return Reflect.metadata(k, v);
+};
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+var InventoryService_1;
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.InventoryService = void 0;
+const common_1 = require("@nestjs/common");
+const prisma_service_1 = require("../prisma.service");
+const axios_1 = __importDefault(require("axios"));
+let InventoryService = InventoryService_1 = class InventoryService {
+    prisma;
+    logger = new common_1.Logger(InventoryService_1.name);
+    APP_ID = 730;
+    CONTEXT_ID = 2;
+    STEAM_API_KEY = process.env.STEAM_API_KEY;
+    STEAM_IMAGE_BASE_URL = 'https://community.fastly.steamstatic.com/economy/image/';
+    activeRequests = new Map();
+    constructor(prisma) {
+        this.prisma = prisma;
+    }
+    async fetchAndSyncInventory(steamId, force = false) {
+        if (this.activeRequests.has(steamId)) {
+            this.logger.log(`Request already in progress for ${steamId}, waiting for it to complete...`);
+            try {
+                return await this.activeRequests.get(steamId);
+            }
+            catch (error) {
+                this.logger.warn(`Active request failed, starting new request`);
+            }
+        }
+        const requestPromise = this._fetchAndSyncInventoryInternal(steamId, force);
+        this.activeRequests.set(steamId, requestPromise);
+        try {
+            const result = await requestPromise;
+            return result;
+        }
+        finally {
+            this.activeRequests.delete(steamId);
+        }
+    }
+    async _fetchAndSyncInventoryInternal(steamId, force = false) {
+        try {
+            this.logger.log(`Starting inventory fetch and sync for Steam ID: ${steamId}, force: ${force}`);
+            if (!force) {
+                const cachedInventory = await this.getCachedInventoryIfRecent(steamId, 15);
+                if (cachedInventory !== null) {
+                    this.logger.log(`Returning cached inventory (updated less than 15 minutes ago). Items: ${cachedInventory.length}`);
+                    return cachedInventory;
+                }
+            }
+            else {
+                this.logger.log('Force refresh requested, bypassing cache');
+            }
+            const allItems = [];
+            let startAssetId = undefined;
+            let hasMore = true;
+            let pageCount = 0;
+            const maxPages = 50;
+            const allDescriptions = [];
+            while (hasMore && pageCount < maxPages) {
+                try {
+                    const inventoryData = await this.fetchInventoryPage(steamId, startAssetId);
+                    if (!inventoryData || !inventoryData.success) {
+                        this.logger.warn(`Steam returned success: false. Message: ${inventoryData?.message || 'Unknown'}`);
+                        break;
+                    }
+                    allDescriptions.push(...inventoryData.descriptions);
+                    const items = this.mapAssetsToItems(inventoryData.assets, inventoryData.descriptions);
+                    allItems.push(...items);
+                    this.logger.log(`Page ${pageCount + 1}: Fetched ${items.length} items. Total so far: ${allItems.length}`);
+                    hasMore = inventoryData.more_items === 1 && inventoryData.last_assetid != null;
+                    startAssetId = inventoryData.last_assetid;
+                    if (hasMore) {
+                        this.logger.log(`Waiting 4 seconds before fetching next page to avoid rate limits...`);
+                        await new Promise(resolve => setTimeout(resolve, 4000));
+                    }
+                    pageCount++;
+                }
+                catch (error) {
+                    if (axios_1.default.isAxiosError(error)) {
+                        const status = error.response?.status;
+                        if (status === 429 || status === 400 || status === 403) {
+                            this.logger.warn(`Steam blocked request (${status}). Checking database for cached data...`);
+                            const cached = await this.getUserInventory(steamId);
+                            if (cached.length > 0) {
+                                this.logger.log(`Steam blocked (${status}), but returning ${cached.length} cached items from database`);
+                                return cached;
+                            }
+                            else {
+                                if (status === 400) {
+                                    this.logger.error(`Steam returned 400 and no cached data available`);
+                                    throw new common_1.HttpException('Инвентарь недоступен. Убедитесь, что инвентарь Steam установлен как публичный в настройках приватности.', common_1.HttpStatus.BAD_REQUEST);
+                                }
+                                else if (status === 403) {
+                                    this.logger.error(`Steam returned 403 and no cached data available`);
+                                    throw new common_1.HttpException('Инвентарь недоступен. Инвентарь должен быть публичным в настройках приватности Steam.', common_1.HttpStatus.FORBIDDEN);
+                                }
+                                else if (status === 429) {
+                                    this.logger.error(`Steam Rate Limit (429) and no cached data available`);
+                                    throw new common_1.HttpException('Превышен лимит запросов к Steam. Попробуйте позже. Steam временно заблокировал запросы.', common_1.HttpStatus.TOO_MANY_REQUESTS);
+                                }
+                            }
+                        }
+                    }
+                    this.logger.error(`Error fetching inventory page: ${error.message}. Checking for cached data...`);
+                    const cached = await this.getUserInventory(steamId);
+                    if (cached.length > 0) {
+                        this.logger.log(`Returning ${cached.length} cached items due to error`);
+                        return cached;
+                    }
+                    throw error;
+                }
+            }
+            const marketableItems = allItems.filter(item => item.marketable === 1);
+            this.logger.log(`Total items fetched: ${allItems.length}, Marketable: ${marketableItems.length}`);
+            if (marketableItems.length === 0 && allItems.length > 0) {
+                this.logger.warn('No marketable items found. All items in inventory are non-marketable.');
+            }
+            if (allDescriptions.length > 0) {
+                await this.syncItemsToDatabase(allDescriptions);
+            }
+            if (marketableItems.length > 0) {
+                try {
+                    await this.saveInventory(steamId, marketableItems);
+                }
+                catch (dbError) {
+                    this.logger.warn(`Failed to save inventory to DB: ${dbError.message}`);
+                }
+            }
+            return marketableItems;
+        }
+        catch (error) {
+            this.logger.warn(`Error in fetchAndSyncInventory: ${error.message}. Checking database for cached data...`);
+            const cached = await this.getUserInventory(steamId);
+            if (cached.length > 0) {
+                this.logger.log(`Steam unavailable, but returning ${cached.length} cached items from database`);
+                return cached;
+            }
+            if (error instanceof common_1.HttpException) {
+                throw error;
+            }
+            this.logger.error(`Failed to fetch inventory and no cached data available: ${error.message}`);
+            throw new common_1.HttpException(`Не удалось загрузить инвентарь: ${error.message}`, common_1.HttpStatus.INTERNAL_SERVER_ERROR);
+        }
+    }
+    async syncItemsToDatabase(descriptions) {
+        this.logger.log(`Syncing ${descriptions.length} item descriptions to database...`);
+        const uniqueDescriptions = new Map();
+        for (const desc of descriptions) {
+            const marketHashName = desc.market_hash_name || desc.market_name || desc.name;
+            if (marketHashName && !uniqueDescriptions.has(marketHashName)) {
+                uniqueDescriptions.set(marketHashName, desc);
+            }
+        }
+        this.logger.log(`Found ${uniqueDescriptions.size} unique items to sync`);
+        let created = 0;
+        let updated = 0;
+        for (const [marketHashName, desc] of uniqueDescriptions) {
+            try {
+                const iconUrl = desc.icon_url || desc.icon_url_large || '';
+                let imageUrl = '';
+                if (iconUrl) {
+                    let imagePath = iconUrl;
+                    if (imagePath.startsWith('http://') || imagePath.startsWith('https://')) {
+                        const urlMatch = imagePath.match(/\/economy\/image\/(.+)$/);
+                        if (urlMatch) {
+                            imagePath = urlMatch[1];
+                        }
+                        else {
+                            imageUrl = imagePath;
+                        }
+                    }
+                    if (!imageUrl) {
+                        const cleanPath = imagePath.startsWith('/') ? imagePath.substring(1) : imagePath;
+                        const baseUrl = process.env.APP_URL || 'http://localhost:3000';
+                        imageUrl = `${baseUrl}/image-proxy/${encodeURIComponent(cleanPath)}`;
+                    }
+                    this.logger.debug(`Syncing item ${marketHashName} with imageUrl: ${imageUrl}`);
+                }
+                else {
+                    this.logger.warn(`No icon_url for item: ${marketHashName}`);
+                }
+                const rarityTag = desc.tags?.find(tag => tag.category === 'Rarity');
+                const rarity = rarityTag?.localized_tag_name || rarityTag?.name || null;
+                const item = await this.prisma.item.upsert({
+                    where: { marketHashName },
+                    update: {
+                        name: desc.market_hash_name || desc.market_name || desc.name,
+                        imageUrl: imageUrl,
+                        iconUrl: iconUrl,
+                        type: desc.type || null,
+                        rarity: rarity,
+                        marketable: desc.marketable || 0,
+                        tradable: desc.tradable || 0,
+                        updatedAt: new Date(),
+                    },
+                    create: {
+                        marketHashName,
+                        name: desc.market_hash_name || desc.market_name || desc.name,
+                        imageUrl: imageUrl,
+                        iconUrl: iconUrl,
+                        type: desc.type || null,
+                        rarity: rarity,
+                        marketable: desc.marketable || 0,
+                        tradable: desc.tradable || 0,
+                    },
+                });
+                if (item.createdAt.getTime() === item.updatedAt.getTime()) {
+                    created++;
+                }
+                else {
+                    updated++;
+                }
+            }
+            catch (error) {
+                this.logger.error(`Error syncing item ${marketHashName}: ${error.message}`);
+            }
+        }
+        this.logger.log(`Database sync complete: ${created} created, ${updated} updated`);
+    }
+    async fetchUserInventory(steamId) {
+        return this.fetchAndSyncInventory(steamId);
+    }
+    async fetchInventoryPage(steamId, startAssetId) {
+        const baseUrl = `https://steamcommunity.com/inventory/${steamId}/${this.APP_ID}/${this.CONTEXT_ID}`;
+        const params = new URLSearchParams({
+            l: 'russian',
+            count: '1000',
+        });
+        if (startAssetId) {
+            params.append('start_assetid', startAssetId);
+        }
+        const url = `${baseUrl}?${params.toString()}`;
+        this.logger.log(`Fetching inventory page from: ${url}`);
+        const userAgents = [
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+        ];
+        const randomUserAgent = userAgents[Math.floor(Math.random() * userAgents.length)];
+        const config = {
+            headers: {
+                'User-Agent': randomUserAgent,
+                'Referer': `https://steamcommunity.com/profiles/${steamId}/inventory`,
+                'Accept': 'application/json',
+                'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'Connection': 'keep-alive',
+                'Sec-Fetch-Dest': 'empty',
+                'Sec-Fetch-Mode': 'cors',
+                'Sec-Fetch-Site': 'same-origin',
+            },
+            timeout: 20000,
+            validateStatus: (status) => status < 500,
+        };
+        const response = await axios_1.default.get(url, config);
+        if (response.status !== 200) {
+            this.logger.error(`Steam API returned status ${response.status}`);
+            throw new Error(`Steam API returned status ${response.status}`);
+        }
+        if (!response.data) {
+            throw new Error('Empty response from Steam API');
+        }
+        return response.data;
+    }
+    mapAssetsToItems(assets, descriptions) {
+        const items = [];
+        for (const asset of assets) {
+            const description = descriptions.find(desc => desc.classid === asset.classid &&
+                (desc.instanceid === asset.instanceid ||
+                    (desc.instanceid === '0' && asset.instanceid === '0')));
+            if (!description) {
+                this.logger.debug(`No description found for asset: classid=${asset.classid}, instanceid=${asset.instanceid}`);
+                continue;
+            }
+            const iconUrl = description.icon_url || description.icon_url_large || '';
+            let imageUrl = '';
+            if (iconUrl) {
+                let imagePath = iconUrl;
+                if (imagePath.startsWith('http://') || imagePath.startsWith('https://')) {
+                    const urlMatch = imagePath.match(/\/economy\/image\/(.+)$/);
+                    if (urlMatch) {
+                        imagePath = urlMatch[1];
+                    }
+                    else {
+                        imageUrl = imagePath;
+                    }
+                }
+                if (!imageUrl) {
+                    const cleanPath = imagePath.startsWith('/') ? imagePath.substring(1) : imagePath;
+                    const baseUrl = process.env.APP_URL || 'http://localhost:3000';
+                    imageUrl = `${baseUrl}/image-proxy/${encodeURIComponent(cleanPath)}`;
+                }
+                this.logger.debug(`Built image URL for ${description.market_hash_name}: ${imageUrl} (from icon_url: ${iconUrl})`);
+            }
+            else {
+                this.logger.warn(`No icon_url found for item: ${description.market_hash_name || description.name || 'Unknown'}`);
+            }
+            const rarityTag = description.tags?.find(tag => tag.category === 'Rarity');
+            const rarity = rarityTag?.localized_tag_name || rarityTag?.name || '';
+            const name = description.market_hash_name || description.market_name || description.name || 'Unknown Item';
+            items.push({
+                assetId: asset.assetid,
+                name: name,
+                imageUrl: imageUrl,
+                rarity: rarity,
+                type: description.type || '',
+                marketable: description.marketable || 0,
+                tradable: description.tradable || 0,
+            });
+        }
+        return items;
+    }
+    async saveInventory(steamId, items) {
+        try {
+            return await this.prisma.userInventory.upsert({
+                where: { userSteamId: steamId },
+                update: {
+                    items: items,
+                    updatedAt: new Date()
+                },
+                create: {
+                    userSteamId: steamId,
+                    items: items,
+                },
+            });
+        }
+        catch (error) {
+            this.logger.error(`Error saving inventory to DB: ${error.message}`);
+            throw error;
+        }
+    }
+    async getUserInventory(steamId) {
+        try {
+            const inventory = await this.prisma.userInventory.findUnique({
+                where: { userSteamId: steamId }
+            });
+            if (!inventory || !inventory.items) {
+                return [];
+            }
+            const items = inventory.items;
+            return Array.isArray(items) ? items : [];
+        }
+        catch (error) {
+            this.logger.error(`Error getting inventory from DB: ${error.message}`);
+            return [];
+        }
+    }
+    async getCachedInventoryIfRecent(steamId, minutes) {
+        try {
+            const inventory = await this.prisma.userInventory.findUnique({
+                where: { userSteamId: steamId }
+            });
+            if (!inventory || !inventory.items) {
+                this.logger.log('No cached inventory found in database');
+                return null;
+            }
+            const now = new Date();
+            const cacheAge = now.getTime() - inventory.updatedAt.getTime();
+            const cacheAgeMinutes = cacheAge / (1000 * 60);
+            if (cacheAgeMinutes < minutes) {
+                const items = inventory.items;
+                const parsedItems = Array.isArray(items) ? items : [];
+                this.logger.log(`Cache is fresh (${cacheAgeMinutes.toFixed(1)} minutes old, threshold: ${minutes} minutes)`);
+                return parsedItems;
+            }
+            else {
+                this.logger.log(`Cache is stale (${cacheAgeMinutes.toFixed(1)} minutes old, threshold: ${minutes} minutes)`);
+                return null;
+            }
+        }
+        catch (error) {
+            this.logger.error(`Error checking cache: ${error.message}`);
+            return null;
+        }
+    }
+};
+exports.InventoryService = InventoryService;
+exports.InventoryService = InventoryService = InventoryService_1 = __decorate([
+    (0, common_1.Injectable)(),
+    __metadata("design:paramtypes", [prisma_service_1.PrismaService])
+], InventoryService);
